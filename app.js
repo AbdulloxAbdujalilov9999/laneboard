@@ -36,6 +36,8 @@ const ICONS = {
   refresh: svg(`<path d="M4 12a8 8 0 0 1 14.3-5"/><path d="M18 3v5h-5"/><path d="M20 12a8 8 0 0 1-14.3 5"/><path d="M6 21v-5h5"/>`),
   logout: svg(`<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>`),
   user: svg(`<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>`),
+  download: svg(`<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/>`),
+  wifiOff: svg(`<path d="M1 9a16 16 0 0 1 4.5-3M8.5 4.5A16 16 0 0 1 23 9M5 12.5a10 10 0 0 1 4-2.5m6 0a10 10 0 0 1 2.5 1.5M8.5 16a6 6 0 0 1 7 0"/><circle cx="12" cy="20" r="1"/><path d="M1 1l22 22"/>`),
 };
 const icon = (name, cls = "") => `<span class="i ${cls}">${ICONS[name]}</span>`;
 const arrowIcon = icon("arrow");
@@ -76,11 +78,20 @@ function fromApiLoad(row) {
     notes: row.notes, isLane: row.isLane === true || row.isLane === "TRUE" || row.isLane === "true",
   };
 }
+function debounce(fn, ms) { let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); }; }
+
+/* Last-loaded snapshot, scoped per signed-in email so a shared device never
+   flashes one person's loads before another's sign-in finishes checking. */
+const cacheKey = () => "hwl-cache:" + (me?.email || "");
+function readCache() { try { return JSON.parse(localStorage.getItem(cacheKey())); } catch { return null; } }
+function writeCache(loads) { try { localStorage.setItem(cacheKey(), JSON.stringify({ loads, at: Date.now() })); } catch {} }
 
 /* =====================================================================
    2. AUTH / GATE
    ===================================================================== */
 let me = null;
+let lastLoad = null;
+let refreshTimer = null;
 
 function setAuthView(view, opts = {}) {
   document.body.classList.toggle("authed", view === "ready");
@@ -133,6 +144,7 @@ async function handleLogin(e) {
 }
 
 function signOut() {
+  stopAutoRefresh();
   localStorage.removeItem(TOKEN_KEY);
   me = null; state.loads = [];
   setAuthView("form");
@@ -142,7 +154,12 @@ async function afterLogin() {
   if (me.role === "hr") { setAuthView("no-access", { email: me.email, role: me.role }); return; }
   setAuthView("ready");
   $("#userChipText").textContent = `${me.name} · ${label(me.role)}`;
+
+  const cached = readCache();
+  if (cached) { state.loads = cached.loads; lastLoad = cached.at; populateDispatcherFilter(); renderAll(); updateLastLoadLabel(); }
+
   await refreshLoads();
+  startAutoRefresh();
 }
 
 async function refreshLoads() {
@@ -150,14 +167,32 @@ async function refreshLoads() {
   try {
     const res = await api("loadAll");
     state.loads = (res.data?.loads || []).map(fromApiLoad);
+    writeCache(state.loads);
+    lastLoad = Date.now();
+    populateDispatcherFilter();
     renderAll();
+    updateLastLoadLabel();
   } catch (err) {
-    if (err.code === "auth") { localStorage.removeItem(TOKEN_KEY); me = null; setAuthView("form", { error: "Your session expired — sign in again." }); }
+    if (err.code === "auth") { stopAutoRefresh(); localStorage.removeItem(TOKEN_KEY); me = null; setAuthView("form", { error: "Your session expired — sign in again." }); }
     else toast(err.message || "Couldn't load data.");
   } finally {
     if (btn) btn.classList.remove("spinning");
   }
 }
+
+function updateLastLoadLabel() {
+  const el = $("#lastLoad"); if (!el) return;
+  el.textContent = lastLoad ? "Updated " + new Date(lastLoad).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+/* Keeps data fresh without a manual click; pauses while the tab is hidden
+   or the browser is offline so it never fights a slow/dead connection. */
+const AUTO_REFRESH_MS = 3 * 60 * 1000;
+function startAutoRefresh() {
+  stopAutoRefresh();
+  refreshTimer = setInterval(() => { if (!document.hidden && navigator.onLine) refreshLoads(); }, AUTO_REFRESH_MS);
+}
+function stopAutoRefresh() { clearInterval(refreshTimer); refreshTimer = null; }
 
 function toast(msg) {
   const el = document.createElement("div");
@@ -166,12 +201,18 @@ function toast(msg) {
   setTimeout(() => el.remove(), 4000);
 }
 
+function updateOfflineBanner() {
+  document.body.classList.toggle("offline", !navigator.onLine);
+  if (navigator.onLine && me) refreshLoads();
+}
+
 async function boot() {
   populateFilterOptions();
   wireStaticIcons();
   applyTheme();
   initMap();
   wireEvents();
+  updateOfflineBanner();
 
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) { setAuthView("form"); return; }
@@ -192,12 +233,22 @@ async function boot() {
 function mondayOf(d) { const x = new Date(d); const day = x.getDay(); const diff = (day === 0 ? -6 : 1) - day; x.setDate(x.getDate() + diff); x.setHours(0, 0, 0, 0); return x; }
 const isoDate = d => { const x = new Date(d); return x.getFullYear() + "-" + String(x.getMonth() + 1).padStart(2, "0") + "-" + String(x.getDate()).padStart(2, "0"); };
 
+const SORTS = {
+  pickupAsc: { label: "Pickup date (earliest)", cmp: (a, b) => new Date(a.pickupDate) - new Date(b.pickupDate) },
+  pickupDesc: { label: "Pickup date (latest)", cmp: (a, b) => new Date(b.pickupDate) - new Date(a.pickupDate) },
+  rateDesc: { label: "Broker rate (high to low)", cmp: (a, b) => (b.brokerRate || 0) - (a.brokerRate || 0) },
+  rpmDesc: { label: "RPM (high to low)", cmp: (a, b) => (perMile(b.brokerRate, b.miles) || 0) - (perMile(a.brokerRate, a.miles) || 0) },
+  milesDesc: { label: "Miles (high to low)", cmp: (a, b) => (b.miles || 0) - (a.miles || 0) },
+};
+
 const state = {
   loads: [],
   tab: "loads",
   search: "",
   status: "",
   equipment: "",
+  dispatcher: "",
+  sortBy: "pickupAsc",
   weekStart: isoDate(mondayOf(new Date())),
   weekActive: false,
   selectedId: null,
@@ -216,18 +267,26 @@ function filteredLoads() {
   }
   if (state.status) rows = rows.filter(l => l.status === state.status);
   if (state.equipment) rows = rows.filter(l => l.equipment === state.equipment);
+  if (state.dispatcher) rows = rows.filter(l => l.dispatcher === state.dispatcher);
   if (state.search.trim()) {
     const q = state.search.trim().toLowerCase();
     rows = rows.filter(l => [l.ref, l.pickupLocation, l.deliveryLocation, l.broker, l.commodity].some(v => String(v || "").toLowerCase().includes(q)));
   }
-  return [...rows].sort((a, b) => new Date(a.pickupDate) - new Date(b.pickupDate));
+  return [...rows].sort(SORTS[state.sortBy].cmp);
+}
+
+function populateDispatcherFilter() {
+  const sel = $("#dispatcherFilter"); if (!sel) return;
+  const current = state.dispatcher;
+  const names = [...new Set(state.loads.map(l => l.dispatcher).filter(Boolean))].sort();
+  sel.innerHTML = `<option value="">All dispatchers</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  if (names.includes(current)) sel.value = current; else state.dispatcher = "";
 }
 
 /* =====================================================================
    4. TOP STAT STRIP
    ===================================================================== */
-function renderStats() {
-  const rows = filteredLoads();
+function renderStats(rows) {
   const miles = rows.reduce((s, l) => s + Number(l.miles || 0), 0);
   const revenue = rows.reduce((s, l) => s + Number(l.brokerRate || 0), 0);
   const rpm = perMile(revenue, miles);
@@ -284,8 +343,7 @@ function cardHtml(l) {
   </div>`;
 }
 
-function renderList() {
-  const rows = filteredLoads();
+function renderList(rows) {
   $("#listCount").textContent = `${rows.length} load${rows.length === 1 ? "" : "s"}`;
   $("#listScroll").innerHTML = rows.length ? rows.map(cardHtml).join("") : `<div class="empty">No loads match these filters.</div>`;
 }
@@ -337,10 +395,12 @@ function initMap() {
 }
 function updateTiles() { $("#map").parentElement.classList.toggle("dark-tiles", state.theme === "dark"); }
 
-function renderMapOverview() {
+const MAP_OVERVIEW_CAP = 300; // drawing every route gets slow well past this; the list and stats stay exact regardless
+function renderMapOverview(allRows) {
   map.invalidateSize();
   overviewLayer.clearLayers();
-  const rows = filteredLoads().filter(l => l.id !== state.selectedId && l.pickupLat != null && l.deliveryLat != null);
+  const eligible = allRows.filter(l => l.id !== state.selectedId && l.pickupLat != null && l.deliveryLat != null);
+  const rows = eligible.slice(0, MAP_OVERVIEW_CAP);
   const bounds = [];
   for (const l of rows) {
     const a = [l.pickupLat, l.pickupLng], b = [l.deliveryLat, l.deliveryLng];
@@ -351,6 +411,7 @@ function renderMapOverview() {
   }
   if (!state.selectedId && bounds.length) map.fitBounds(bounds, { padding: [40, 40] });
   else if (!bounds.length && !state.selectedId) map.setView([39.5, -98.35], 4);
+  $("#mapCapNote").textContent = eligible.length > MAP_OVERVIEW_CAP ? `Showing ${MAP_OVERVIEW_CAP} of ${eligible.length} routes on the map — narrow your filters to see the rest.` : "";
 }
 
 async function renderSelectedRoute() {
@@ -394,18 +455,36 @@ async function drivingRoute(a, b) {
   } catch { return null; }
 }
 
-function refreshMap() { renderMapOverview(); renderSelectedRoute(); }
+function refreshMap(rows) { renderMapOverview(rows); renderSelectedRoute(); }
 
 /* =====================================================================
    8. RENDER ORCHESTRATION
    ===================================================================== */
 function renderAll() {
-  renderStats();
-  if (state.tab === "loads") { renderList(); refreshMap(); } else { renderLanes(); }
+  const rows = filteredLoads(); // computed once per pass, not once per widget
+  renderStats(rows);
+  if (state.tab === "loads") { renderList(rows); refreshMap(rows); } else { renderLanes(); }
 }
 
 /* =====================================================================
-   9. EVENTS
+   9. EXPORT
+   ===================================================================== */
+function exportCsv() {
+  const rows = filteredLoads();
+  if (!rows.length) { toast("No loads to export with these filters."); return; }
+  const cols = ["ref", "status", "pickupLocation", "pickupDate", "deliveryLocation", "deliveryDate", "miles", "broker", "dispatcher", "commodity", "equipment", "weightLbs", "brokerRate", "carrierRate", "isLane", "notes"];
+  const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = [cols.join(","), ...rows.map(l => cols.map(c => cell(l[c])).join(","))].join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `haulwise-loads-${isoDate(new Date())}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* =====================================================================
+   10. EVENTS
    ===================================================================== */
 function applyTheme() {
   document.documentElement.setAttribute("data-theme", state.theme);
@@ -416,6 +495,7 @@ function applyTheme() {
 function populateFilterOptions() {
   $("#statusFilter").innerHTML = `<option value="">All statuses</option>` + LOAD_STATUSES.map(s => `<option value="${s}">${label(s)}</option>`).join("");
   $("#equipFilter").innerHTML = `<option value="">All equipment</option>` + EQUIPMENT.map(e => `<option value="${e}">${e}</option>`).join("");
+  $("#sortSelect").innerHTML = Object.entries(SORTS).map(([k, s]) => `<option value="${k}">${s.label}</option>`).join("");
 }
 
 function wireStaticIcons() {
@@ -426,6 +506,8 @@ function wireStaticIcons() {
   $("#clearFilters").innerHTML = `${icon("filter")}<span>Clear filters</span>`;
   $("#refreshBtn").innerHTML = icon("refresh");
   $("#signOutBtn").innerHTML = icon("logout");
+  $("#exportCsvBtn").innerHTML = `${icon("download")}<span>Export CSV</span>`;
+  $("#offlineBanner").innerHTML = `${icon("wifiOff")}<span>You're offline — showing the last loads that were loaded.</span>`;
 }
 
 function wireEvents() {
@@ -437,9 +519,20 @@ function wireEvents() {
     renderAll();
   }));
 
-  $("#searchInput").addEventListener("input", e => { state.search = e.target.value; renderAll(); });
+  $("#searchInput").addEventListener("input", debounce(e => { state.search = e.target.value; renderAll(); }, 150));
   $("#statusFilter").addEventListener("change", e => { state.status = e.target.value; renderAll(); });
   $("#equipFilter").addEventListener("change", e => { state.equipment = e.target.value; renderAll(); });
+  $("#dispatcherFilter").addEventListener("change", e => { state.dispatcher = e.target.value; renderAll(); });
+  $("#sortSelect").addEventListener("change", e => { state.sortBy = e.target.value; renderAll(); });
+  $("#exportCsvBtn").addEventListener("click", exportCsv);
+
+  document.addEventListener("keydown", e => {
+    if (e.key !== "/" || e.target.matches("input, textarea, select")) return;
+    e.preventDefault(); $("#searchInput").focus();
+  });
+  window.addEventListener("online", updateOfflineBanner);
+  window.addEventListener("offline", updateOfflineBanner);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && me) refreshLoads(); });
 
   $("#weekStart").value = state.weekStart;
   $("#weekStart").addEventListener("change", e => { state.weekStart = e.target.value; state.weekActive = true; renderAll(); });
@@ -448,8 +541,8 @@ function wireEvents() {
   $("#clearWeek").addEventListener("click", () => { state.weekActive = false; renderAll(); });
 
   $("#clearFilters").addEventListener("click", () => {
-    state.search = ""; state.status = ""; state.equipment = ""; state.weekActive = false;
-    $("#searchInput").value = ""; $("#statusFilter").value = ""; $("#equipFilter").value = "";
+    state.search = ""; state.status = ""; state.equipment = ""; state.dispatcher = ""; state.weekActive = false;
+    $("#searchInput").value = ""; $("#statusFilter").value = ""; $("#equipFilter").value = ""; $("#dispatcherFilter").value = "";
     renderAll();
   });
 
@@ -485,6 +578,6 @@ function wireEvents() {
 }
 
 /* =====================================================================
-   10. BOOT
+   11. BOOT
    ===================================================================== */
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
