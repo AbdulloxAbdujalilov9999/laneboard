@@ -73,7 +73,7 @@ function fromApiLoad(row) {
     deliveryLocation: row.deliveryLocation, deliveryDate: row.deliveryDate, deliveryLat: row.deliveryLat, deliveryLng: row.deliveryLng,
     pickupRegion: regionOf(row.pickupLocation), deliveryRegion: regionOf(row.deliveryLocation),
     commodity: row.commodity, equipment: row.equipment, weightLbs: row.weightLbs,
-    broker: row.brokerName, dispatcher: row.dispatcherName,
+    broker: row.brokerName, brokerLoadNumber: row.brokerLoadNumber, dispatcher: row.dispatcherName,
     brokerRate: row.brokerRate, carrierRate: row.carrierRate, miles: row.miles,
     notes: row.notes, isLane: row.isLane === true || row.isLane === "TRUE" || row.isLane === "true",
   };
@@ -156,7 +156,7 @@ async function afterLogin() {
   $("#userChipText").textContent = `${me.name} · ${label(me.role)}`;
 
   const cached = readCache();
-  if (cached) { state.loads = cached.loads; lastLoad = cached.at; populateDispatcherFilter(); renderAll(); updateLastLoadLabel(); }
+  if (cached) { state.loads = cached.loads; lastLoad = cached.at; populateDispatcherFilter(); renderAll(); updateLastLoadLabel(); applyDeepLink(false); }
 
   await refreshLoads();
   startAutoRefresh();
@@ -172,6 +172,7 @@ async function refreshLoads() {
     populateDispatcherFilter();
     renderAll();
     updateLastLoadLabel();
+    applyDeepLink(true);
   } catch (err) {
     if (err.code === "auth") { stopAutoRefresh(); localStorage.removeItem(TOKEN_KEY); me = null; setAuthView("form", { error: "Your session expired — sign in again." }); }
     else toast(err.message || "Couldn't load data.");
@@ -207,6 +208,7 @@ function updateOfflineBanner() {
 }
 
 async function boot() {
+  readDeepLink();
   populateFilterOptions();
   wireStaticIcons();
   applyTheme();
@@ -259,6 +261,26 @@ const state = {
 
 function byId(id) { return state.loads.find(l => l.id === id); }
 
+/* Links from Haulwise Dispatch look like  .../#load=LD-10001  and open that load: the filters are cleared,
+   the card is expanded and its route is drawn. It waits for the loads to arrive if they haven't yet. */
+let pendingRef = null;
+function readDeepLink() {
+  const ref = new URLSearchParams(location.hash.replace(/^#/, "")).get("load");
+  if (ref) { pendingRef = ref.trim(); history.replaceState(null, "", location.pathname + location.search); }
+}
+function applyDeepLink(final) {
+  if (!pendingRef) return;
+  const want = pendingRef.toLowerCase(), l = state.loads.find(x => String(x.ref || "").toLowerCase() === want || String(x.brokerLoadNumber || "").toLowerCase() === want);
+  if (!l) { if (final) { toast(`Load ${pendingRef} wasn't found.`); pendingRef = null; } return; }
+  pendingRef = null;
+  state.search = ""; state.status = ""; state.equipment = ""; state.dispatcher = ""; state.weekActive = false;
+  $("#searchInput").value = ""; $("#statusFilter").value = ""; $("#equipFilter").value = ""; $("#dispatcherFilter").value = "";
+  state.tab = "loads"; $$(".tabs button").forEach(x => x.classList.toggle("active", x.dataset.tab === "loads"));
+  $("#loadsView").style.display = "flex"; $("#lanesView").style.display = "none";
+  state.selectedId = l.id; state.openId = l.id; renderAll();
+  requestAnimationFrame(() => document.querySelector(`.card[data-id="${CSS.escape(l.id)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+}
+
 function filteredLoads() {
   let rows = state.loads;
   if (state.weekActive) {
@@ -270,7 +292,7 @@ function filteredLoads() {
   if (state.dispatcher) rows = rows.filter(l => l.dispatcher === state.dispatcher);
   if (state.search.trim()) {
     const q = state.search.trim().toLowerCase();
-    rows = rows.filter(l => [l.ref, l.pickupLocation, l.deliveryLocation, l.broker, l.commodity].some(v => String(v || "").toLowerCase().includes(q)));
+    rows = rows.filter(l => [l.ref, l.brokerLoadNumber, l.pickupLocation, l.deliveryLocation, l.broker, l.commodity].some(v => String(v || "").toLowerCase().includes(q)));
   }
   return [...rows].sort(SORTS[state.sortBy].cmp);
 }
@@ -325,6 +347,7 @@ function cardHtml(l) {
         <div class="detail-item"><div class="l">Pickup</div><div class="v">${esc(l.pickupLocation)}</div><div class="muted">${fmtDateTime(l.pickupDate)}</div></div>
         <div class="detail-item"><div class="l">Delivery</div><div class="v">${esc(l.deliveryLocation)}</div><div class="muted">${fmtDateTime(l.deliveryDate)}</div></div>
         <div class="detail-item"><div class="l">Broker</div><div class="v">${esc(l.broker || "—")}</div></div>
+        ${l.brokerLoadNumber ? `<div class="detail-item"><div class="l">Broker load #</div><div class="v">${esc(l.brokerLoadNumber)}</div></div>` : ""}
         <div class="detail-item"><div class="l">Dispatcher</div><div class="v">${esc(l.dispatcher || "—")}</div></div>
         <div class="detail-item"><div class="l">Commodity</div><div class="v">${esc(l.commodity || "—")}</div></div>
         <div class="detail-item"><div class="l">Equipment</div><div class="v">${esc(l.equipment || "—")}</div></div>
@@ -472,7 +495,7 @@ function renderAll() {
 function exportCsv() {
   const rows = filteredLoads();
   if (!rows.length) { toast("No loads to export with these filters."); return; }
-  const cols = ["ref", "status", "pickupLocation", "pickupDate", "deliveryLocation", "deliveryDate", "miles", "broker", "dispatcher", "commodity", "equipment", "weightLbs", "brokerRate", "carrierRate", "isLane", "notes"];
+  const cols = ["ref", "status", "pickupLocation", "pickupDate", "deliveryLocation", "deliveryDate", "miles", "broker", "brokerLoadNumber", "dispatcher", "commodity", "equipment", "weightLbs", "brokerRate", "carrierRate", "isLane", "notes"];
   const cell = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const csv = [cols.join(","), ...rows.map(l => cols.map(c => cell(l[c])).join(","))].join("\r\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -530,6 +553,7 @@ function wireEvents() {
     if (e.key !== "/" || e.target.matches("input, textarea, select")) return;
     e.preventDefault(); $("#searchInput").focus();
   });
+  window.addEventListener("hashchange", () => { readDeepLink(); if (me) applyDeepLink(!!lastLoad); });          // a link clicked while Haulwise Loads is already open
   window.addEventListener("online", updateOfflineBanner);
   window.addEventListener("offline", updateOfflineBanner);
   document.addEventListener("visibilitychange", () => { if (!document.hidden && me) refreshLoads(); });

@@ -10,6 +10,14 @@ edited in Haulwise Dispatch. Left: a live map with pickup/delivery markers
 and the driving route. Right: every load as a card you can expand for full
 detail. A Lanes tab aggregates just the loads marked as a lane.
 
+## Opening a load from Haulwise Dispatch
+
+A link like `https://<this-site>/#load=LD-10001` opens that load: filters are cleared, its card is
+expanded and its route is drawn. The value can be the load reference or the broker's load #. Haulwise
+Dispatch's **Open in Laneboard** button uses it, and it waits for sign-in and for the loads to arrive.
+Loads read from a rate confirmation in Haulwise Dispatch show the broker's **Broker load #** here too
+(card detail, search, CSV export).
+
 ## What's inside
 
 - **Sign in** — the same email/password accounts as Haulwise Dispatch,
